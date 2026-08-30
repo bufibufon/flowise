@@ -4,7 +4,19 @@ import { DynamicStructuredTool } from '@langchain/core/tools'
 import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
 import { getCredentialData, getCredentialParam } from '../../../src/utils'
 
-const DEFAULT_DESCRIPTION = `Search the campaigns Airtable using structured preferences and lexical relevance. The result includes a databaseDictionary that distinguishes controlled/faceted fields from descriptive narrative fields. Read it before ranking: use enum-like fields as evidence and soft facets, and Description/BoardDescription for mechanisms, contexts and creative analogies. For a normal campaign request, make one broad call alongside vector_search and request 15–20 candidates; do not re-query this tool once per vector candidate. By default, year, award/festival, client, country, category and audience improve ranking but do not exclude useful adjacent results. Use strict mode only when the user explicitly requires every supplied filter. The result is authoritative for the records it returns.`
+const DEFAULT_DESCRIPTION = `Search the campaigns Airtable using structured preferences and lexical relevance. The result includes a databaseDictionary that distinguishes controlled/faceted fields from descriptive narrative fields. Read it before ranking: use enum-like fields as evidence and soft facets, and Description/BoardDescription for mechanisms, contexts and creative analogies. For a normal campaign request, make one broad call alongside vector_search and request 15–20 candidates; do not re-query this tool once per vector candidate. For a same-brief follow-up asking for more, call this tool with reusePrevious=true and excludeNames set to campaigns already shown; a cache hit returns the previous pool without rescanning Airtable. By default, year, award/festival, client, country, category and audience improve ranking but do not exclude useful adjacent results. Use strict mode only when the user explicitly requires every supplied filter. The result is authoritative for the records it returns.`
+
+const CAMPAIGN_CACHE_TTL_MS = 2 * 60 * 60 * 1000
+const CAMPAIGN_CACHE_MAX_SESSIONS = 100
+
+interface CachedCampaignPool {
+    createdAt: number
+    query: ICommonObject
+    databaseDictionary: ICommonObject
+    records: ICommonObject[]
+}
+
+const campaignPoolCache = new Map<string, CachedCampaignPool>()
 
 const normalize = (value: unknown): string =>
     String(value ?? '')
@@ -298,6 +310,7 @@ class AirtableSearch_Tools implements INode {
                   .filter(Boolean)
             : []
         const maxRecords = Math.max(1, Math.min(parseInt(maxRecordsInput || '2000', 10), 10000))
+        const cacheKey = String(options.chatId || options.sessionId || '')
 
         const schema = z.object({
             query: z.string().describe('Original campaign search request, retaining all important keywords'),
@@ -312,10 +325,48 @@ class AirtableSearch_Tools implements INode {
                 .optional()
                 .default(false)
                 .describe('Exclude records missing any supplied filter. Use only when the user explicitly forbids near matches.'),
+            reusePrevious: z
+                .boolean()
+                .optional()
+                .default(false)
+                .describe(
+                    'For a same-brief follow-up asking for more, reuse the candidate pool stored for this chat instead of rescanning Airtable.'
+                ),
+            excludeNames: z
+                .array(z.string())
+                .optional()
+                .default([])
+                .describe('Campaign names already shown in this conversation; cached follow-ups exclude them.'),
             limit: z.number().int().min(1).max(30).optional().default(18).describe('Maximum number of records to return')
         })
 
         const func = async (input: z.infer<typeof schema>): Promise<string> => {
+            const excludedNames = new Set((input.excludeNames || []).map(normalize))
+            const cachedPool = cacheKey ? campaignPoolCache.get(cacheKey) : undefined
+            const freshCachedPool = cachedPool && Date.now() - cachedPool.createdAt <= CAMPAIGN_CACHE_TTL_MS ? cachedPool : undefined
+
+            if (input.reusePrevious && freshCachedPool) {
+                const cachedRecords = freshCachedPool.records
+                    .filter((record) => !excludedNames.has(normalize((record.fields as ICommonObject)?.Name)))
+                    .slice(0, input.limit ?? 18)
+                return JSON.stringify({
+                    query: input,
+                    cache: {
+                        status: 'hit',
+                        poolSize: freshCachedPool.records.length,
+                        excludedCount: excludedNames.size,
+                        remainingCount: cachedRecords.length,
+                        originalQuery: freshCachedPool.query
+                    },
+                    scannedRecords: 0,
+                    matchedRecords: cachedRecords.length,
+                    databaseDictionary: freshCachedPool.databaseDictionary,
+                    records: cachedRecords
+                })
+            }
+
+            if (input.reusePrevious && cachedPool && !freshCachedPool) campaignPoolCache.delete(cacheKey)
+
             const records: AirtableRecord[] = []
             let offset: string | undefined
             let metadataFields: AirtableFieldSchema[] | undefined
@@ -355,7 +406,7 @@ class AirtableSearch_Tools implements INode {
                 .filter((term) => term.length > 1 && !STOP_WORDS.has(term))
             const normalizedQuery = normalize(input.query)
 
-            const ranked = records
+            const rankedPool = records
                 .slice(0, maxRecords)
                 .map((record) => {
                     const allText = normalize(flatten(record.fields))
@@ -418,13 +469,36 @@ class AirtableSearch_Tools implements INode {
                 })
                 .filter((record): record is NonNullable<typeof record> => record !== null)
                 .sort((a, b) => b.score - a.score)
+                .slice(0, 30)
+
+            const databaseDictionary = buildDatabaseDictionary(records.slice(0, maxRecords), metadataFields)
+            if (cacheKey) {
+                if (campaignPoolCache.size >= CAMPAIGN_CACHE_MAX_SESSIONS) {
+                    const oldestKey = campaignPoolCache.keys().next().value
+                    if (oldestKey) campaignPoolCache.delete(oldestKey)
+                }
+                campaignPoolCache.set(cacheKey, {
+                    createdAt: Date.now(),
+                    query: input,
+                    databaseDictionary,
+                    records: rankedPool
+                })
+            }
+
+            const ranked = rankedPool
+                .filter((record) => !excludedNames.has(normalize((record.fields as ICommonObject)?.Name)))
                 .slice(0, input.limit ?? 18)
 
             return JSON.stringify({
                 query: input,
+                cache: {
+                    status: cacheKey ? 'stored' : 'unavailable',
+                    poolSize: rankedPool.length,
+                    excludedCount: excludedNames.size
+                },
                 scannedRecords: Math.min(records.length, maxRecords),
                 matchedRecords: ranked.length,
-                databaseDictionary: buildDatabaseDictionary(records.slice(0, maxRecords), metadataFields),
+                databaseDictionary,
                 records: ranked
             })
         }
