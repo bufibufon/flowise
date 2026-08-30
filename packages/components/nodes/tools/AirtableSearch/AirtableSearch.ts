@@ -4,7 +4,7 @@ import { DynamicStructuredTool } from '@langchain/core/tools'
 import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
 import { getCredentialData, getCredentialParam } from '../../../src/utils'
 
-const DEFAULT_DESCRIPTION = `Search the campaigns Airtable using structured preferences and lexical relevance. Call this tool for every campaign-search request, alongside vector_search. By default, year, award/festival, client, country, category and audience improve ranking but do not exclude useful adjacent results. Use strict mode only when the user explicitly requires every supplied filter. The result is authoritative for exact Airtable field values.`
+const DEFAULT_DESCRIPTION = `Search the campaigns Airtable using structured preferences and lexical relevance. For a normal campaign request, make one broad call alongside vector_search and request 15–20 candidates; do not re-query this tool once per vector candidate. By default, year, award/festival, client, country, category and audience improve ranking but do not exclude useful adjacent results. Use strict mode only when the user explicitly requires every supplied filter. The result is authoritative for the records it returns.`
 
 const normalize = (value: unknown): string =>
     String(value ?? '')
@@ -27,6 +27,26 @@ const fieldText = (fields: ICommonObject, keyPattern: RegExp): string =>
         .join(' ')
 
 const matches = (haystack: string, needle?: string | number): boolean => !needle || normalize(haystack).includes(normalize(needle))
+
+const preferenceMatches = (haystack: string, needle?: string | number): boolean => {
+    if (!needle) return true
+    const normalizedHaystack = normalize(haystack)
+    const normalizedNeedle = normalize(needle)
+    if (normalizedHaystack.includes(normalizedNeedle)) return true
+
+    const meaningfulTerms = normalizedNeedle
+        .split(' ')
+        .filter((term) => term.length > 2 && !STOP_WORDS.has(term))
+    return meaningfulTerms.some((term) => normalizedHaystack.includes(term))
+}
+
+const compactFields = (fields: ICommonObject): ICommonObject =>
+    Object.fromEntries(
+        Object.entries(fields).map(([key, value]) => {
+            if (typeof value !== 'string' || value.length <= 1600 || /(url|link|video|board)/.test(normalize(key))) return [key, value]
+            return [key, `${value.slice(0, 1600)}…`]
+        })
+    )
 
 const STOP_WORDS = new Set([
     'a',
@@ -172,7 +192,7 @@ class AirtableSearch_Tools implements INode {
                 .optional()
                 .default(false)
                 .describe('Exclude records missing any supplied filter. Use only when the user explicitly forbids near matches.'),
-            limit: z.number().int().min(1).max(100).optional().default(30).describe('Maximum number of records to return')
+            limit: z.number().int().min(1).max(30).optional().default(18).describe('Maximum number of records to return')
         })
 
         const func = async (input: z.infer<typeof schema>): Promise<string> => {
@@ -214,15 +234,19 @@ class AirtableSearch_Tools implements INode {
                     const countryText = fieldText(record.fields, /(country|market|region|kraj)/)
 
                     const filterChecks = [
-                        { name: 'year', value: input.year, text: yearText || allText, weight: 30 },
-                        { name: 'award', value: input.award, text: awardText || allText, weight: 30 },
-                        { name: 'category', value: input.category, text: categoryText || allText, weight: 20 },
-                        { name: 'audience', value: input.audience, text: audienceText || allText, weight: 15 },
-                        { name: 'client', value: input.client, text: clientText || allText, weight: 25 },
-                        { name: 'country', value: input.country, text: countryText || allText, weight: 20 }
+                        { name: 'year', value: input.year, text: yearText || allText, weight: 30, broad: false },
+                        { name: 'award', value: input.award, text: `${awardText} ${allText}`, weight: 30, broad: true },
+                        { name: 'category', value: input.category, text: `${categoryText} ${allText}`, weight: 20, broad: true },
+                        { name: 'audience', value: input.audience, text: `${audienceText} ${allText}`, weight: 15, broad: true },
+                        { name: 'client', value: input.client, text: clientText || allText, weight: 25, broad: false },
+                        { name: 'country', value: input.country, text: countryText || allText, weight: 20, broad: false }
                     ].filter((filter) => filter.value !== undefined && filter.value !== '')
-                    const matchedFilters = filterChecks.filter((filter) => matches(filter.text, filter.value))
-                    const missingFilters = filterChecks.filter((filter) => !matches(filter.text, filter.value))
+                    const matchedFilters = filterChecks.filter((filter) =>
+                        filter.broad ? preferenceMatches(filter.text, filter.value) : matches(filter.text, filter.value)
+                    )
+                    const missingFilters = filterChecks.filter(
+                        (filter) => !(filter.broad ? preferenceMatches(filter.text, filter.value) : matches(filter.text, filter.value))
+                    )
 
                     if (input.strict && missingFilters.length) return null
 
@@ -256,12 +280,12 @@ class AirtableSearch_Tools implements INode {
                         matchedTerms: [...new Set(evidence)],
                         matchedFilters: matchedFilters.map((filter) => filter.name),
                         missingFilters: missingFilters.map((filter) => filter.name),
-                        fields: record.fields
+                        fields: compactFields(record.fields)
                     }
                 })
                 .filter((record): record is NonNullable<typeof record> => record !== null)
                 .sort((a, b) => b.score - a.score)
-                .slice(0, input.limit ?? 30)
+                .slice(0, input.limit ?? 18)
 
             return JSON.stringify({
                 query: input,
