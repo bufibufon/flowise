@@ -4,7 +4,7 @@ import { DynamicStructuredTool } from '@langchain/core/tools'
 import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
 import { getCredentialData, getCredentialParam } from '../../../src/utils'
 
-const DEFAULT_DESCRIPTION = `Search the campaigns Airtable using structured preferences and lexical relevance. For a normal campaign request, make one broad call alongside vector_search and request 15–20 candidates; do not re-query this tool once per vector candidate. By default, year, award/festival, client, country, category and audience improve ranking but do not exclude useful adjacent results. Use strict mode only when the user explicitly requires every supplied filter. The result is authoritative for the records it returns.`
+const DEFAULT_DESCRIPTION = `Search the campaigns Airtable using structured preferences and lexical relevance. The result includes a databaseDictionary that distinguishes controlled/faceted fields from descriptive narrative fields. Read it before ranking: use enum-like fields as evidence and soft facets, and Description/BoardDescription for mechanisms, contexts and creative analogies. For a normal campaign request, make one broad call alongside vector_search and request 15–20 candidates; do not re-query this tool once per vector candidate. By default, year, award/festival, client, country, category and audience improve ranking but do not exclude useful adjacent results. Use strict mode only when the user explicitly requires every supplied filter. The result is authoritative for the records it returns.`
 
 const normalize = (value: unknown): string =>
     String(value ?? '')
@@ -16,7 +16,10 @@ const normalize = (value: unknown): string =>
 
 const flatten = (value: unknown): string => {
     if (Array.isArray(value)) return value.map(flatten).join(' ')
-    if (value && typeof value === 'object') return Object.values(value as Record<string, unknown>).map(flatten).join(' ')
+    if (value && typeof value === 'object')
+        return Object.values(value as Record<string, unknown>)
+            .map(flatten)
+            .join(' ')
     return String(value ?? '')
 }
 
@@ -34,10 +37,9 @@ const preferenceMatches = (haystack: string, needle?: string | number): boolean 
     const normalizedNeedle = normalize(needle)
     if (normalizedHaystack.includes(normalizedNeedle)) return true
 
-    const meaningfulTerms = normalizedNeedle
-        .split(' ')
-        .filter((term) => term.length > 2 && !STOP_WORDS.has(term))
-    return meaningfulTerms.some((term) => normalizedHaystack.includes(term))
+    const meaningfulTerms = normalizedNeedle.split(' ').filter((term) => term.length > 3 && !PREFERENCE_STOP_WORDS.has(term))
+    const haystackTerms = new Set(normalizedHaystack.split(' '))
+    return meaningfulTerms.some((term) => haystackTerms.has(term))
 }
 
 const compactFields = (fields: ICommonObject): ICommonObject =>
@@ -74,6 +76,20 @@ const STOP_WORDS = new Set([
     'z'
 ])
 
+const PREFERENCE_STOP_WORDS = new Set([
+    ...STOP_WORDS,
+    'activation',
+    'brand',
+    'campaign',
+    'campaigns',
+    'creative',
+    'experience',
+    'marketing',
+    'retail',
+    'service',
+    'services'
+])
+
 interface AirtableRecord {
     id: string
     createdTime?: string
@@ -83,6 +99,110 @@ interface AirtableRecord {
 interface AirtableResponse {
     records: AirtableRecord[]
     offset?: string
+}
+
+interface AirtableFieldChoice {
+    name: string
+}
+
+interface AirtableFieldSchema {
+    id: string
+    name: string
+    type: string
+    options?: {
+        choices?: AirtableFieldChoice[]
+    }
+}
+
+interface AirtableTableSchema {
+    id: string
+    name: string
+    fields: AirtableFieldSchema[]
+}
+
+interface AirtableBaseSchemaResponse {
+    tables: AirtableTableSchema[]
+}
+
+type FieldRole = 'facet' | 'narrative' | 'identity' | 'media' | 'other'
+
+const classifyField = (name: string, type?: string): FieldRole => {
+    const normalizedName = normalize(name)
+    if (/(description|board description|summary|idea|insight|execution|mechanism|opis)/.test(normalizedName)) return 'narrative'
+    if (/(url|link|video|board url|case film|attachment|image|thumbnail)/.test(normalizedName)) return 'media'
+    if (/(^| )(name|title|client|brand|agency|year|date)( |$)/.test(normalizedName)) return 'identity'
+    if (
+        ['singleSelect', 'multipleSelects', 'checkbox', 'rating'].includes(type || '') ||
+        /(^| )(audience|category|tag|country|market|region|award|festival|sector|industry|vertical)( |$)/.test(normalizedName)
+    )
+        return 'facet'
+    return 'other'
+}
+
+const collectObservedValues = (records: AirtableRecord[], fieldName: string): string[] => {
+    const values = new Set<string>()
+    for (const record of records) {
+        const rawValue = record.fields[fieldName]
+        const candidates = Array.isArray(rawValue) ? rawValue : [rawValue]
+        for (const candidate of candidates) {
+            if (candidate === undefined || candidate === null || typeof candidate === 'object') continue
+            const value = String(candidate).trim()
+            if (value && value.length <= 120) values.add(value)
+            if (values.size >= 60) return [...values]
+        }
+    }
+    return [...values]
+}
+
+const buildDatabaseDictionary = (records: AirtableRecord[], metadataFields?: AirtableFieldSchema[]) => {
+    const fieldNames = new Set<string>()
+    for (const record of records) Object.keys(record.fields).forEach((field) => fieldNames.add(field))
+
+    const metadataByName = new Map((metadataFields || []).map((field) => [field.name, field]))
+    for (const field of metadataFields || []) fieldNames.add(field.name)
+
+    const fields = [...fieldNames].map((name) => {
+        const metadata = metadataByName.get(name)
+        const role = classifyField(name, metadata?.type)
+        const declaredChoices = metadata?.options?.choices?.map((choice) => choice.name).filter(Boolean) || []
+        const observedValues = role === 'facet' ? collectObservedValues(records, name) : []
+        return {
+            name,
+            type:
+                metadata?.type ||
+                (records.some((record) => Array.isArray(record.fields[name])) ? 'observedMultipleValues' : 'observedValue'),
+            role,
+            ...(declaredChoices.length ? { enumValues: declaredChoices.slice(0, 80) } : {}),
+            ...(observedValues.length ? { observedValues: observedValues.slice(0, 40) } : {})
+        }
+    })
+
+    return {
+        source: metadataFields?.length ? 'airtable_metadata_api' : 'inferred_from_scanned_records',
+        usage: {
+            facet: 'Controlled or repeated vocabulary. Use for exact evidence and soft ranking; do not require an exact label unless the user says only/must.',
+            narrative:
+                'Free text. Search Description and BoardDescription for insight, mechanism, execution, setting and lateral creative analogies.',
+            identity: 'Grounded facts such as campaign name, client, agency and year.',
+            media: 'Grounded case-board/video assets; never invent or repair URLs.'
+        },
+        semanticVectorFields: [
+            'Name',
+            'Client',
+            'Agency',
+            'Year',
+            'Country',
+            'Award',
+            'Category',
+            'Audience',
+            'Tag',
+            'Description',
+            'BoardDescription',
+            'VideoUrl',
+            'BoardURL'
+        ],
+        fields
+    }
 }
 
 class AirtableSearch_Tools implements INode {
@@ -198,6 +318,19 @@ class AirtableSearch_Tools implements INode {
         const func = async (input: z.infer<typeof schema>): Promise<string> => {
             const records: AirtableRecord[] = []
             let offset: string | undefined
+            let metadataFields: AirtableFieldSchema[] | undefined
+
+            try {
+                const metadataResponse = await axios.get<AirtableBaseSchemaResponse>(
+                    `https://api.airtable.com/v0/meta/bases/${encodeURIComponent(baseId)}/tables`,
+                    { headers: { Authorization: `Bearer ${accessToken}` } }
+                )
+                const tableSchema = metadataResponse.data.tables.find((table) => table.id === tableId || table.name === tableId)
+                metadataFields = tableSchema?.fields
+            } catch {
+                // Some valid Airtable tokens intentionally omit schema.bases:read.
+                // In that case the dictionary is inferred from the records below.
+            }
 
             do {
                 const params = new URLSearchParams()
@@ -291,6 +424,7 @@ class AirtableSearch_Tools implements INode {
                 query: input,
                 scannedRecords: Math.min(records.length, maxRecords),
                 matchedRecords: ranked.length,
+                databaseDictionary: buildDatabaseDictionary(records.slice(0, maxRecords), metadataFields),
                 records: ranked
             })
         }
