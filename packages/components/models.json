@@ -1762,6 +1762,14 @@
             "name": "chatOpenAI",
             "models": [
                 {
+                    "label": "gpt-5.6-terra",
+                    "name": "gpt-5.6-terra"
+                },
+                {
+                    "label": "gpt-5.6-luna",
+                    "name": "gpt-5.6-luna"
+                },
+                {
                     "label": "gpt-5.5",
                     "name": "gpt-5.5",
                     "input_cost": 0.000005,
