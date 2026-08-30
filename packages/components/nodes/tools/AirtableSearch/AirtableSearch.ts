@@ -1,8 +1,8 @@
 import axios from 'axios'
 import { z } from 'zod/v3'
+import { DynamicStructuredTool } from '@langchain/core/tools'
 import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
 import { getCredentialData, getCredentialParam } from '../../../src/utils'
-import { DynamicStructuredTool } from '../CustomTool/core'
 
 const DEFAULT_DESCRIPTION = `Search the campaigns Airtable using exact filters and lexical relevance. Call this tool for every campaign-search request, in parallel with vector_search. Treat year, award/festival, client, country, category and audience as hard filters when the user supplies them. The result is authoritative for exact Airtable field values.`
 
@@ -263,7 +263,6 @@ class AirtableSearch_Tools implements INode {
             name: 'airtable_search',
             description,
             schema,
-            code: '',
             func
         })
     }
