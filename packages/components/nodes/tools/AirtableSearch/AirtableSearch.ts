@@ -4,7 +4,7 @@ import { DynamicStructuredTool } from '@langchain/core/tools'
 import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
 import { getCredentialData, getCredentialParam } from '../../../src/utils'
 
-const DEFAULT_DESCRIPTION = `Search the campaigns Airtable using exact filters and lexical relevance. Call this tool for every campaign-search request, in parallel with vector_search. Treat year, award/festival, client, country, category and audience as hard filters when the user supplies them. The result is authoritative for exact Airtable field values.`
+const DEFAULT_DESCRIPTION = `Search the campaigns Airtable using structured preferences and lexical relevance. Call this tool for every campaign-search request, alongside vector_search. By default, year, award/festival, client, country, category and audience improve ranking but do not exclude useful adjacent results. Use strict mode only when the user explicitly requires every supplied filter. The result is authoritative for exact Airtable field values.`
 
 const normalize = (value: unknown): string =>
     String(value ?? '')
@@ -161,12 +161,17 @@ class AirtableSearch_Tools implements INode {
 
         const schema = z.object({
             query: z.string().describe('Original campaign search request, retaining all important keywords'),
-            year: z.union([z.string(), z.number()]).optional().describe('Required campaign or award year'),
-            award: z.string().optional().describe('Required award or festival, for example Cannes Lions'),
-            category: z.string().optional().describe('Required industry, sector or campaign category'),
-            audience: z.string().optional().describe('Required target audience, for example Gen Z'),
-            client: z.string().optional().describe('Required client or brand'),
-            country: z.string().optional().describe('Required country or market'),
+            year: z.union([z.string(), z.number()]).optional().describe('Preferred campaign or award year'),
+            award: z.string().optional().describe('Preferred award or festival, for example Cannes Lions'),
+            category: z.string().optional().describe('Preferred industry, sector or campaign category'),
+            audience: z.string().optional().describe('Preferred target audience, for example Gen Z'),
+            client: z.string().optional().describe('Preferred client or brand'),
+            country: z.string().optional().describe('Preferred country or market'),
+            strict: z
+                .boolean()
+                .optional()
+                .default(false)
+                .describe('Exclude records missing any supplied filter. Use only when the user explicitly forbids near matches.'),
             limit: z.number().int().min(1).max(100).optional().default(30).describe('Maximum number of records to return')
         })
 
@@ -208,12 +213,18 @@ class AirtableSearch_Tools implements INode {
                     const clientText = fieldText(record.fields, /(client|brand|advertiser|marka|klient)/)
                     const countryText = fieldText(record.fields, /(country|market|region|kraj)/)
 
-                    if (!matches(yearText || allText, input.year)) return null
-                    if (!matches(awardText || allText, input.award)) return null
-                    if (!matches(categoryText || allText, input.category)) return null
-                    if (!matches(audienceText || allText, input.audience)) return null
-                    if (!matches(clientText || allText, input.client)) return null
-                    if (!matches(countryText || allText, input.country)) return null
+                    const filterChecks = [
+                        { name: 'year', value: input.year, text: yearText || allText, weight: 30 },
+                        { name: 'award', value: input.award, text: awardText || allText, weight: 30 },
+                        { name: 'category', value: input.category, text: categoryText || allText, weight: 20 },
+                        { name: 'audience', value: input.audience, text: audienceText || allText, weight: 15 },
+                        { name: 'client', value: input.client, text: clientText || allText, weight: 25 },
+                        { name: 'country', value: input.country, text: countryText || allText, weight: 20 }
+                    ].filter((filter) => filter.value !== undefined && filter.value !== '')
+                    const matchedFilters = filterChecks.filter((filter) => matches(filter.text, filter.value))
+                    const missingFilters = filterChecks.filter((filter) => !matches(filter.text, filter.value))
+
+                    if (input.strict && missingFilters.length) return null
 
                     let score = normalizedQuery && allText.includes(normalizedQuery) ? 80 : 0
                     const evidence: string[] = []
@@ -236,14 +247,15 @@ class AirtableSearch_Tools implements INode {
                         }
                     }
 
-                    for (const filter of [input.year, input.award, input.category, input.audience, input.client, input.country]) {
-                        if (filter) score += 25
-                    }
+                    score += matchedFilters.reduce((total, filter) => total + filter.weight, 0)
+                    score -= missingFilters.length * 3
 
                     return {
                         id: record.id,
                         score,
                         matchedTerms: [...new Set(evidence)],
+                        matchedFilters: matchedFilters.map((filter) => filter.name),
+                        missingFilters: missingFilters.map((filter) => filter.name),
                         fields: record.fields
                     }
                 })
